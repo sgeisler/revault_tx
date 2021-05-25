@@ -32,6 +32,7 @@ use {
 };
 
 use std::{collections::BTreeMap, convert::TryInto, fmt};
+use crate::bitcoin::util::psbt::PartiallySignedTransaction;
 
 /// The value of the CPFP output in the Unvault transaction.
 /// See [practical-revault](https://github.com/revault/practical-revault/blob/master/transactions.md#unvault_tx).
@@ -59,6 +60,30 @@ pub const TX_VERSION: i32 = 2;
 /// https://github.com/bitcoin/bitcoin/blob/590e49ccf2af27c6c1f1e0eb8be3a4bf4d92ce8b/src/policy/policy.h#L23-L24
 pub const MAX_STANDARD_TX_WEIGHT: u32 = 400_000;
 
+/// This private module is used to make mutable references to the PSBT inside transaction newtypes
+/// available to functions inside the transaction module, but not beyond that. This is needed to
+/// guarantee invariants that could not be guaranteed if users had arbitrary mutable access to the
+/// inner PSBT.
+pub(super) mod inner_mut {
+    use crate::error::TransactionSerialisationError;
+    use crate::transactions::Psbt;
+
+    pub trait PrivateInnerMut: Sized {
+        /// Get a mutable reference to the inner transaction, this is only used internally
+        fn inner_tx_mut(&mut self) -> &mut Psbt;
+
+        /// Get a reference to the inner transaction, this is only used internally
+        fn inner_tx(&self) -> &Psbt;
+
+        /// Move inner transaction out
+        fn into_psbt(self) -> Psbt;
+
+        fn from_psbt_serialized(
+            raw_psbt: &[u8],
+        ) -> Result<Self, TransactionSerialisationError>;
+    }
+}
+
 /// A Revault transaction.
 ///
 /// Wraps a rust-bitcoin PSBT and defines some BIP174 roles as methods.
@@ -73,12 +98,106 @@ pub trait RevaultTransaction: fmt::Debug + Clone + PartialEq {
     /// Get the inner transaction
     fn inner_tx(&self) -> &Psbt;
 
-    // FIXME: don't expose this. Maybe a private trait?
-    /// Get the inner transaction
-    fn inner_tx_mut(&mut self) -> &mut Psbt;
-
     /// Move inner transaction out
     fn into_psbt(self) -> Psbt;
+
+    /// Get the sighash for an input spending an internal Revault TXO.
+    /// **Do not use it for fee bumping inputs, use
+    /// [RevaultTransaction::signature_hash_feebump_input] instead**
+    ///
+    /// Will error if the input is out of bounds or the PSBT input does not contain a Witness
+    /// Script (ie was already finalized).
+    fn signature_hash_internal_input(
+        &self,
+        input_index: usize,
+        sighash_type: SigHashType,
+    ) -> Result<SigHash, InputSatisfactionError>;
+
+    /// Get the signature hash for an externally-managed fee-bumping input.
+    ///
+    /// Returns `None` if the input does not exist.
+    fn signature_hash_feebump_input(
+        &self,
+        input_index: usize,
+        script_code: &Script,
+        sighash_type: SigHashType,
+    ) -> Result<SigHash, InputSatisfactionError>;
+
+    /// Add a signature in order to eventually satisfy this input.
+    /// Some sanity checks against the PSBT Input are done here, but no signature check.
+    ///
+    /// Bigger warning: **the signature is not checked for its validity**.
+    ///
+    /// The BIP174 Signer role.
+    fn add_signature(
+        &mut self,
+        input_index: usize,
+        pubkey: BitcoinPubKey,
+        signature: BitcoinSig,
+    ) -> Result<Option<Vec<u8>>, InputSatisfactionError>;
+
+    /// Check and satisfy the scripts, create the witnesses.
+    ///
+    /// The BIP174 Input Finalizer role.
+    fn finalize(
+        &mut self,
+        ctx: &secp256k1::Secp256k1<impl secp256k1::Verification>,
+    ) -> Result<(), Error>;
+
+    /// Check the transaction is valid (fully-signed) and can be finalized.
+    /// Slighty more efficient than calling [RevaultTransaction::finalize] on a clone as it gets
+    /// rid of the belt-and-suspenders checks.
+    fn is_finalizable(&self, ctx: &secp256k1::Secp256k1<impl secp256k1::Verification>) -> bool;
+
+    /// Check if the transaction was already finalized.
+    fn is_finalized(&self) -> bool;
+
+    /// Check the transaction is valid
+    fn is_valid(&self, ctx: &secp256k1::Secp256k1<impl secp256k1::Verification>) -> bool;
+
+    /// Verify an input of the transaction against libbitcoinconsensus out of the information
+    /// contained in the PSBT input.
+    fn verify_input(&self, input_index: usize) -> Result<(), Error>;
+
+    /// Get the network-serialized (inner) transaction. You likely want to be sure
+    /// the transaction [RevaultTransaction.is_finalized] before serializing it.
+    ///
+    /// The BIP174 Transaction Extractor (without any check, which are done in
+    /// [RevaultTransaction.finalize]).
+    fn into_bitcoin_serialized(self) -> Vec<u8>;
+
+    /// Get the BIP174-serialized (inner) transaction.
+    fn as_psbt_serialized(&self) -> Vec<u8>;
+
+    /// Create a RevaultTransaction from a BIP174-serialized transaction.
+    fn from_psbt_serialized(raw_psbt: &[u8]) -> Result<Self, TransactionSerialisationError>;
+
+    /// Get the BIP174-serialized (inner) transaction encoded in base64.
+    fn as_psbt_string(&self) -> String;
+
+    /// Create a RevaultTransaction from a base64-encoded BIP174-serialized transaction.
+    fn from_psbt_str(psbt_str: &str) -> Result<Self, TransactionSerialisationError>;
+
+    /// Get the hexadecimal representation of the transaction as used by the bitcoind API.
+    fn hex(&self) -> String;
+
+    fn fees(&self) -> u64;
+
+    /// Get the inner unsigned transaction id
+    fn txid(&self) -> Txid;
+
+    /// Get the inner unsigned transaction hash with witness data
+    fn wtxid(&self) -> Wtxid;
+}
+
+impl<T: inner_mut::PrivateInnerMut + fmt::Debug + Clone + PartialEq> RevaultTransaction for T {
+    fn inner_tx(&self) -> &PartiallySignedTransaction {
+        inner_mut::PrivateInnerMut::inner_tx(self)
+    }
+
+    fn into_psbt(self) -> PartiallySignedTransaction {
+        inner_mut::PrivateInnerMut::into_psbt(self)
+    }
 
     /// Get the sighash for an input spending an internal Revault TXO.
     /// **Do not use it for fee bumping inputs, use
@@ -297,7 +416,7 @@ pub trait RevaultTransaction: fmt::Debug + Clone + PartialEq {
             self.clone().into_bitcoin_serialized().as_slice(),
             input_index,
         )
-        .map_err(|e| e.into())
+            .map_err(|e| e.into())
     }
 
     /// Get the network-serialized (inner) transaction. You likely want to be sure
@@ -324,7 +443,9 @@ pub trait RevaultTransaction: fmt::Debug + Clone + PartialEq {
     }
 
     /// Create a RevaultTransaction from a BIP174-serialized transaction.
-    fn from_psbt_serialized(raw_psbt: &[u8]) -> Result<Self, TransactionSerialisationError>;
+    fn from_psbt_serialized(raw_psbt: &[u8]) -> Result<Self, TransactionSerialisationError> {
+        <Self as inner_mut::PrivateInnerMut>::from_psbt_serialized(raw_psbt)
+    }
 
     /// Get the BIP174-serialized (inner) transaction encoded in base64.
     fn as_psbt_string(&self) -> String {
@@ -391,7 +512,7 @@ macro_rules! impl_revault_transaction {
         #[derive(Debug, Clone, PartialEq)]
         pub struct $transaction_name(Psbt);
 
-        impl RevaultTransaction for $transaction_name {
+        impl inner_mut::PrivateInnerMut for $transaction_name {
             fn inner_tx(&self) -> &Psbt {
                 &self.0
             }
